@@ -113,20 +113,19 @@ function findLastMappedSourceOffset(node: Node): number | null {
 }
 
 function rawSourceOffsetFromCaret(container: Node, offset: number): number | null {
-  const own = renderedSourceOffsets.get(container);
-  if (own) return Math.max(own.start, Math.min(own.start + offset, own.end));
-  const children = Array.from(container.childNodes);
-  if (offset > 0) {
-    const previous = children[offset - 1];
-    if (previous) {
-      const mapped = findLastMappedSourceOffset(previous);
-      if (mapped !== null) return mapped;
+  // Walk up the parent chain looking for the nearest registered source
+  // range. The click-time Text returned by caretPositionFromPoint is the
+  // same Text we register (it has no child nodes), so the lookup almost
+  // always hits on the first iteration. The fallback walk guards against
+  // rare cases where the click lands on a wrapper Element whose inner
+  // Text has not been registered (caller may drill down before calling).
+  let cur: Node | null = container;
+  while (cur) {
+    const own = renderedSourceOffsets.get(cur);
+    if (own) {
+      return Math.max(own.start, Math.min(own.start + offset, own.end));
     }
-  }
-  const next = children[offset];
-  if (next) {
-    const mapped = findFirstMappedSourceOffset(next);
-    if (mapped !== null) return mapped;
+    cur = cur.parentNode;
   }
   return null;
 }
@@ -137,6 +136,61 @@ function rawSourceOffsetFromPoint(td: HTMLElement, event: MouseEvent): number | 
     caretRangeFromPoint?: (x: number, y: number) => Range | null;
   };
   const position = doc.caretPositionFromPoint?.(event.clientX, event.clientY);
+  // [Fix-A] Sub-rect hit-testing is only needed when the browser API returns
+  // a non-Text offsetNode (an inline wrapper like <strong>, <em>, <del>,
+  // <a>, <code>). For those cases a left-half click used to collapse to the
+  // mapped start offset of the inner Text (raw offset 2 for **重点菜单**).
+  //
+  // When the API already returns a Text node we trust caretPos directly:
+  // browsers measure the exact character boundary. Sub-rect hit-testing on
+  // a Text node is less accurate for CJK / monospace / inline boxes because
+  // Text rect.width is the glyph union, not per-glyph, so frac-based
+  // rounding loses precision. The sub-rect path is therefore gated on the
+  // API having returned a non-Text node.
+  const apiTextHit = position?.offsetNode && position.offsetNode.nodeType === 3
+    && td.contains(position.offsetNode);
+  if (!apiTextHit) {
+    const texts = collectTextNodes(td);
+    if (texts.length > 0) {
+      let bestText: Text | null = null;
+      let bestOffset = 0;
+      let bestScore = Infinity;
+      for (const tn of texts) {
+        // jsdom: raw Text nodes don't have getBoundingClientRect (only
+        // Element / Range do). Fall back to the parent Element's rect,
+        // which is the best approximation available in a test env.
+        let rect: DOMRect | undefined;
+        try {
+          const fn = (tn as unknown as { getBoundingClientRect?: () => DOMRect }).getBoundingClientRect;
+          rect = typeof fn === "function" ? fn.call(tn) : undefined;
+        } catch {
+          rect = undefined;
+        }
+        if (!rect || rect.width === 0) {
+          const parent = tn.parentElement;
+          if (parent && typeof parent.getBoundingClientRect === "function") {
+            rect = parent.getBoundingClientRect();
+          }
+        }
+        if (!rect || rect.width === 0) continue;
+        if (event.clientY < rect.top || event.clientY > rect.bottom) continue;
+        let frac = (event.clientX - rect.left) / rect.width;
+        frac = Math.max(0, Math.min(1, frac));
+        const len = tn.textContent?.length ?? 0;
+        const clampedOffset = Math.max(0, Math.min(len, Math.round(frac * len)));
+        const visibleCenter = rect.left + frac * rect.width;
+        const score = Math.abs(event.clientX - visibleCenter);
+        if (score < bestScore) {
+          bestScore = score;
+          bestText = tn;
+          bestOffset = clampedOffset;
+        }
+      }
+      if (bestText) {
+        return rawSourceOffsetFromCaret(bestText, bestOffset);
+      }
+    }
+  }
   if (position && td.contains(position.offsetNode)) {
     return rawSourceOffsetFromCaret(position.offsetNode, position.offset);
   }
@@ -148,8 +202,20 @@ function rawSourceOffsetFromPoint(td: HTMLElement, event: MouseEvent): number | 
 }
 
 function placeRawSourceCaret(td: HTMLElement, rawOffset: number): void {
-  const text = td.firstChild;
-  if (!text || text.nodeType !== Node.TEXT_NODE) return;
+  // Walk the subtree for the first text node instead of using `td.firstChild`.
+  // When the cell renders inline markup the `firstChild` is an element, not a
+  // text node:
+  //   - `**重点菜单**` → `<strong>重点菜单</strong>` → firstChild = <strong>
+  //   - `[**重点菜单**](url)` → `<a><strong>...</strong></a>` → firstChild = <a>
+  //   - `*斜体菜单*` → `<em>...</em>` → firstChild = <em>
+  // The previous implementation bailed out the moment `firstChild.nodeType` was
+  // not TEXT_NODE, which left the caret stuck at the cell origin and surfaced
+  // as "clicking in the middle of a Chinese cell jumps the caret to the start".
+  // The TreeWalker finds the first descendant text node regardless of how deep
+  // the markup nesting goes, so we always have a concrete anchor.
+  const walker = td.ownerDocument.createTreeWalker(td, NodeFilter.SHOW_TEXT);
+  const text = walker.nextNode() as Text | null;
+  if (!text) return;
   const offset = Math.max(0, Math.min(rawOffset, text.textContent?.length ?? 0));
   const range = td.ownerDocument.createRange();
   range.setStart(text, offset);
@@ -1636,9 +1702,25 @@ export class EditableTableWidget extends WidgetType {
           // text was usually shorter than the raw markdown).
           td.style.wordBreak = "break-all";
           td.style.whiteSpace = "pre-wrap";
+          // [Fix-B] Idempotent mode swap. Enter is called from two paths
+          // (activateCellEditing at the click site and the focus event
+          // listener). After the first call the cell already holds a
+          // single Text node matching td.dataset.source. Re-running
+          // `td.textContent = ...` would tear down any range that was
+          // just placed by placeRawSourceCaret, so guard the destructive
+          // swap: if the DOM is already in raw-text mode, leave it alone.
+          const src = td.dataset.source ?? "";
+          const first = td.firstChild;
+          if (
+            first?.nodeType === Node.TEXT_NODE &&
+            (first as Text).data === src &&
+            td.contentEditable === "true"
+          ) {
+            return;
+          }
           // Swap rendered rich DOM for the raw markdown source so the user
           // edits the actual `[text](url)` text instead of just "text".
-          td.textContent = td.dataset.source ?? "";
+          td.textContent = src;
         };
 
         const activateCellEditing = (): void => {
