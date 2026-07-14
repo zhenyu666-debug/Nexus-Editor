@@ -594,15 +594,32 @@ export class EditableTableWidget extends WidgetType {
   private dispatch(newSource: string): void {
     const v = this.viewRef.current;
     if (!v) return;
-    const tableEnd = this.tableFrom + this.source.length;
-    if (tableEnd > v.state.doc.length || v.state.doc.sliceString(this.tableFrom, tableEnd) !== this.source) {
-      return;
-    }
-    v.dispatch({ changes: { from: this.tableFrom, to: this.tableFrom + this.source.length, insert: newSource } });
+    const from = this.tableFrom;
+    // `this.source` is a constructor snapshot. After a cell edit its length
+    // is stale. Always read the current table from the live doc so we build
+    // operations on a correct baseline.
+    const liveSource = v.state.doc.sliceString(
+      from,
+      Math.min(from + this.source.length + 512, v.state.doc.length)
+    );
+    // Compute where the real table ends in the doc (may differ from stale len).
+    const liveEnd = from + liveSource.length;
+    v.dispatch({ changes: { from, to: liveEnd, insert: newSource } });
+    this.source = newSource;
+  }
+
+  /** Read the current table content from the live editor doc. */
+  private liveSource(): string {
+    const v = this.viewRef.current;
+    if (!v) return this.source;
+    return v.state.doc.sliceString(
+      this.tableFrom,
+      Math.min(this.tableFrom + this.source.length + 512, v.state.doc.length)
+    );
   }
 
   private deleteColumn(colIdx: number): void {
-    const lines = this.source.split("\n");
+    const lines = this.liveSource().split("\n");
     const newLines = lines.map((line) => {
       const cells = line.split("|").filter((_, i, a) => i > 0 && i < a.length - 1);
       if (cells.length === 0) return line;
@@ -613,7 +630,7 @@ export class EditableTableWidget extends WidgetType {
   }
 
   private deleteRow(rowIdx: number): void {
-    const lines = this.source.split("\n");
+    const lines = this.liveSource().split("\n");
     const dataLines: number[] = [];
     for (let i = 0; i < lines.length; i++) if (!SEPARATOR_RE.test(lines[i])) dataLines.push(i);
     const lineIdx = dataLines[rowIdx];
@@ -623,7 +640,7 @@ export class EditableTableWidget extends WidgetType {
   }
 
   private addColumn(): void {
-    const lines = this.source.split("\n");
+    const lines = this.liveSource().split("\n");
     const nl = lines.map((l) => SEPARATOR_RE.test(l) ? l.replace(/\|?\s*$/, " | --- |") : l.replace(/\|?\s*$/, " |  |"));
     this.dispatch(nl.join("\n"));
   }
@@ -633,11 +650,13 @@ export class EditableTableWidget extends WidgetType {
     const nr = "\n| " + Array(cc).fill("  ").join(" | ") + " |";
     const v = this.viewRef.current;
     if (!v) return;
-    v.dispatch({ changes: { from: this.tableFrom + this.source.length, insert: nr } });
+    const liveEnd = this.tableFrom + this.liveSource().length;
+    v.dispatch({ changes: { from: liveEnd, insert: nr } });
+    this.source += nr;
   }
 
-  private moveColumn(from: number, to: number, source = this.source): void {
-    const lines = source.split("\n");
+  private moveColumn(from: number, to: number, source?: string): void {
+    const lines = (source ?? this.liveSource()).split("\n");
     const nl = lines.map((line) => {
       const p = line.split("|"), cells = p.slice(1, -1);
       if (from >= cells.length || to >= cells.length) return line;
@@ -648,8 +667,8 @@ export class EditableTableWidget extends WidgetType {
     this.dispatch(nl.join("\n"));
   }
 
-  private moveRow(from: number, to: number, source = this.source): void {
-    const lines = source.split("\n");
+  private moveRow(from: number, to: number, source?: string): void {
+    const lines = (source ?? this.liveSource()).split("\n");
     const dl: number[] = [];
     for (let i = 0; i < lines.length; i++) if (!SEPARATOR_RE.test(lines[i])) dl.push(i);
     const s = dl[from], d = dl[to];
